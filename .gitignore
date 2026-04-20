@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs / state
+*.log
+logs/
+bot_logs/
+trade_history.json
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
+._*
+
+# Chrome user-data dirs (may contain session cookies)
+chrome-profile/
+bot_chrome_profile/
+*-profile/
