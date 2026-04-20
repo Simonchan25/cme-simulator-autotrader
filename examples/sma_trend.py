@@ -37,10 +37,15 @@ MAX_HOLD_SECONDS = 4 * 60 * 60
 STOP_COOLDOWN_SECONDS = 300   # pause after adverse exit
 FLIP_TO_SHORT = True          # if False, close longs on down-cross but don't short
 
-# Trade these instruments (row label, category, trailing-stop $ retrace).
+# Trade these instruments.  Each entry has:
+#   name      — row label in the Markets widget (clicked for TRADE)
+#   contract  — CME symbol (used for real-fill verification via
+#               cme.get_position_qty() / verify_contract=)
+#   category  — Markets-widget category
+#   trail     — trailing-stop $ retrace from favourable peak
 # Adjust to your risk tolerance; trailing stop is in raw price units.
 INSTRUMENTS = [
-    {"name": "Micro Gold", "category": "Metals", "trail": 6.0},
+    {"name": "Micro Gold", "contract": "MGCM6", "category": "Metals", "trail": 6.0},
 ]
 
 
@@ -114,10 +119,14 @@ async def run_one_instrument(cme: CMESimulatorClient, cfg: dict, st: State) -> N
             return
         print(f"[{now:%H:%M:%S}] SIGNAL {cfg['name']} px={px:.4f} "
               f"sma20={sma20:.4f} sma50={sma50:.4f} -> {side}")
-        ok = await (cme.buy_market(cfg["name"]) if side == "BUY"
-                    else cme.sell_market(cfg["name"]))
+        # verify_contract enables the real-fill guard: ok == True only if
+        # the CME Open Positions qty for this contract actually moved.
+        contract = cfg["contract"]
+        ok = await (cme.buy_market(cfg["name"], verify_contract=contract)
+                    if side == "BUY"
+                    else cme.sell_market(cfg["name"], verify_contract=contract))
         if not ok:
-            print(f"  execute failed, will retry next tick")
+            print(f"  execute failed (not filled on CME), will retry next tick")
             return
         st.position = Position(
             name=cfg["name"], side=side, entry_px=px, opened_at=now, peak=px,
@@ -158,10 +167,12 @@ async def run_one_instrument(cme: CMESimulatorClient, cfg: dict, st: State) -> N
     if close:
         print(f"[{now:%H:%M:%S}] CLOSE {pos.side} {cfg['name']} px={px:.4f}: {reason}")
         opp = "SELL" if pos.side == "BUY" else "BUY"
-        ok = await (cme.sell_market(cfg["name"]) if opp == "SELL"
-                    else cme.buy_market(cfg["name"]))
+        contract = cfg["contract"]
+        ok = await (cme.sell_market(cfg["name"], verify_contract=contract)
+                    if opp == "SELL"
+                    else cme.buy_market(cfg["name"], verify_contract=contract))
         if not ok:
-            print("  exit failed, will retry")
+            print("  exit failed (not filled on CME), will retry")
             return
         approx_pnl = (px - pos.entry_px) if pos.side == "BUY" else (pos.entry_px - px)
         print(f"  approx P&L (in price units): {approx_pnl:+.4f}")
@@ -179,6 +190,27 @@ async def main() -> int:
             return 1
 
         states = {cfg["name"]: State() for cfg in INSTRUMENTS}
+
+        # Startup reconciliation: rebuild in-memory position state from the
+        # CME Open Positions table so a restart doesn't try to open a
+        # second position on top of an already-open one.  entry_px is
+        # approximated (we can't recover the original fill price from
+        # display); if you persist trade history to disk, you could match
+        # against the newest OPEN record there to recover it.
+        for cfg in INSTRUMENTS:
+            qty = await cme.get_position_qty(cfg["contract"])
+            if qty == 0:
+                continue
+            side = "BUY" if qty > 0 else "SELL"
+            prices = await cme.read_prices(cfg["name"])
+            px = prices.get(cfg["name"]) or 0.0
+            states[cfg["name"]].position = Position(
+                name=cfg["name"], side=side, entry_px=px,
+                opened_at=datetime.now(), peak=px,
+            )
+            print(f"Reconciled {cfg['contract']}: CME qty={qty} -> tracking "
+                  f"as {side} at current px ${px:.4f}")
+
         print(f"Bot LIVE.  Warmup ~{SMA50_WINDOW * POLL_INTERVAL // 60} min "
               f"before first signal.  Ctrl-C to stop.")
 

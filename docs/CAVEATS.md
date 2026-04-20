@@ -94,10 +94,54 @@ debugging, close DevTools, then restart the bot.
 / Stop-Limit require a few extra fields in the Trade dialog and are
 not implemented.  A contribution adding them would be welcome.
 
+## Silent order rejection (fixed in 0.2.0 via `verify_contract`)
+
+In 0.1.0, `buy_market` / `sell_market` returned True as long as the
+six UI clicks landed — even if CME rejected the order silently (form
+state incomplete, SUBMIT disabled, margin exceeded).  The caller
+logged a filled trade that never happened, and in-memory position
+state drifted from CME reality.
+
+0.2.0 adds three guards inside `_execute_market_order`:
+
+1. **SUBMIT-enabled pre-check.**  If the SUBMIT button is disabled when
+   we reach it (direction tab didn't take effect, order-type didn't
+   register, etc.), abort before clicking instead of silently no-oping.
+2. **Confirm-Order polling.**  After SUBMIT, poll up to 5 s for the
+   Confirm Order dialog to appear.  No dialog → no submission → return
+   False.
+3. **Real position-qty verification.**  When the caller passes
+   ``verify_contract="MGCM6"``, snapshot the signed CME Open Positions
+   qty for that contract before SUBMIT and poll up to 10 s after
+   Confirm for it to change.  If it never changes, the order didn't
+   actually fill — return False.
+
+The third guard is opt-in because it requires the caller to know the
+contract symbol (not just the row name).  Strongly recommended for any
+bot making decisions off the return value.
+
+```python
+# Safer pattern — returns True only if CME position actually moved
+ok = await cme.buy_market("Micro Gold", verify_contract="MGCM6")
+```
+
+When a method returns False, the UI is escape-cleaned and the caller
+can retry on the next tick without a lingering dialog blocking the row.
+
+## Startup reconciliation
+
+If your bot persists trade history to disk but rebuilds open-position
+state in memory, a crash-and-restart cycle can leave the disk file
+with `OPEN` records that never actually filled on CME (phantoms) while
+the in-memory position tracker starts fresh.  The
+``examples/sma_trend.py`` template now demonstrates reconciling the
+two on startup — read CME positions with ``get_position_qty`` and
+rebuild your in-memory state to match before entering the poll loop.
+
 ## Not audited, not production-ready
 
-This is a research tool.  It will at some point fail to close a
-position you thought it had closed, or double-fire an entry.  Do not
-use it for anything you can't afford to lose in a paper account.
-Real-money automation against a brokerage account is a significantly
-different problem and out of scope.
+This is a research tool.  Even with the 0.2.0 guards it will at some
+point fail to close a position you thought it had closed, or
+double-fire an entry.  Do not use it for anything you can't afford to
+lose in a paper account.  Real-money automation against a brokerage
+account is a significantly different problem and out of scope.

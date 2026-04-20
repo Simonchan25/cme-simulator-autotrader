@@ -32,7 +32,14 @@ async def demo():
         # {'Gold': 4810.3, 'Silver': 80.02}
         print(await cme.read_banner())
         # {'funds': 100000.0, 'pnl': 0.0, 'margin': 0.0, ...}
-        await cme.buy_market("Micro Gold")
+
+        # verify_contract makes buy_market return True ONLY if the CME
+        # Open Positions qty for MGCM6 actually changed — catches
+        # silently-rejected orders (0.2.0+).
+        ok = await cme.buy_market("Micro Gold", verify_contract="MGCM6")
+        assert ok, "order didn't land on CME"
+        print(await cme.get_position_qty("MGCM6"))   # 1
+
         print(await cme.read_positions())
         await cme.flatten_all()
 

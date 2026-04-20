@@ -258,22 +258,78 @@ class CMESimulatorClient:
             }"""
         )
 
+    async def get_position_qty(self, contract: str) -> int:
+        """
+        Return the *signed* net open quantity for ``contract`` (e.g.
+        ``"MGCM6"``).  +N for LONG N, -N for SHORT N, 0 if flat or not
+        found.
+
+        Intended use: snapshot before a trade, compare after the Confirm
+        click, and treat "qty unchanged" as a failed fill even if the
+        Confirm button appeared to be clicked.  See ``buy_market`` /
+        ``sell_market`` for the built-in verification path.
+        """
+        assert self.page is not None
+        try:
+            return await self.page.evaluate(
+                """(contract) => {
+                    const rows = Array.from(
+                        document.querySelectorAll('[role="row"]')
+                    ).filter(r => r.offsetParent);
+                    for (const r of rows) {
+                        const cells = Array.from(
+                            r.querySelectorAll('[role="gridcell"], [role="cell"], td')
+                        ).filter(c => c.offsetParent).map(c => c.textContent.trim());
+                        if (cells.length < 6) continue;
+                        // Open Positions rows: [contract, name, month, openPnL,
+                        // totalPnL, "Long N"|"Short N", ...].  Order rows start
+                        // with "Buy"/"Sell", so cells[0] !== contract skips them.
+                        if (cells[0] !== contract) continue;
+                        const m = cells[5].match(/^(Long|Short)\\s*(\\d+)$/);
+                        if (!m) return 0;
+                        const qty = parseInt(m[2], 10);
+                        return m[1] === 'Long' ? qty : -qty;
+                    }
+                    return 0;
+                }""",
+                contract,
+            )
+        except Exception:
+            return 0
+
     # ------------------------------------------------------------------
     # Trading
     # ------------------------------------------------------------------
-    async def _execute_market_order(self, instrument_name: str, side: str) -> bool:
+    async def _execute_market_order(
+        self,
+        instrument_name: str,
+        side: str,
+        verify_contract: str | None = None,
+    ) -> bool:
         """
         Drive the Trade dialog to submit a MARKET order for *instrument_name*
-        on the given *side* ("BUY" or "SELL").  Returns True if the flow
-        reached the final Confirm click without errors.
+        on the given *side* ("BUY" or "SELL").
+
+        Returns True **only** if the full flow succeeded: SUBMIT was enabled,
+        the Confirm Order dialog appeared and was clicked, and — when
+        ``verify_contract`` is given — the CME Open Positions qty for that
+        contract actually changed.
 
         The flow:
           1. Escape + alert-dismiss to ensure a clean state.
           2. Click TRADE on the instrument's row.
           3. Click the ``Buy`` or ``Sell`` direction tab (title-case).
           4. Open the order-type combobox and pick ``Market``.
-          5. Click SUBMIT.
-          6. Click Confirm Order on the confirmation modal (if any).
+          5. (Guard) Verify SUBMIT button is enabled, then click it.
+          6. (Guard) Poll up to 5 s for Confirm Order dialog, click Confirm.
+          7. (Optional guard) Poll up to 10 s for the CME position qty to
+             change.  Only active when ``verify_contract`` is provided.
+
+        The three guards exist because a disabled SUBMIT, a missed Confirm
+        dialog, or a silently-rejected order would otherwise produce a
+        false-positive "fill" — the bot thinks it traded, the CME side
+        hasn't moved.  When ``verify_contract`` is not provided, steps 5
+        and 6 are still enforced but 7 is skipped.
         """
         assert self.page is not None
         page = self.page
@@ -282,6 +338,11 @@ class CMESimulatorClient:
 
         await dismiss_stale_session_alert(page)
         await press_escape(page)
+
+        # Pre-snapshot (used in step 7 if verify_contract)
+        qty_before: int | None = None
+        if verify_contract is not None:
+            qty_before = await self.get_position_qty(verify_contract)
 
         # 1. TRADE button on the matching row
         trade_xy = await page.evaluate(
@@ -383,39 +444,128 @@ class CMESimulatorClient:
         )
         if not sub_xy:
             return False
+
+        # 5a. Pre-submit guard: abort if SUBMIT is disabled (form incomplete).
+        # Clicking a disabled button silently no-ops and we'd falsely think
+        # the order was placed.
+        submit_enabled = await page.evaluate(
+            """(side) => {
+                const ok = ['SUBMIT', side, side + ' Order', 'Submit', 'Place Order'];
+                for (const b of document.querySelectorAll('button, [role="button"]')) {
+                    const r = b.getBoundingClientRect();
+                    const t = b.textContent.trim();
+                    if (ok.includes(t) && r.width > 200 && r.top > 400) {
+                        if (b.disabled || b.getAttribute('aria-disabled') === 'true') return false;
+                        return true;
+                    }
+                }
+                return false;
+            }""",
+            side,
+        )
+        if not submit_enabled:
+            await press_escape(page)
+            return False
+
         await page.mouse.click(sub_xy["x"], sub_xy["y"])
         await asyncio.sleep(1.5)
 
-        # 6. Confirm Order modal (may be skipped if 1-Click is on)
-        conf_xy = await page.evaluate(
-            """() => {
-                const ok = ['Confirm Order', 'CONFIRM ORDER', 'Confirm'];
-                for (const b of document.querySelectorAll('button')) {
-                    if (ok.includes(b.textContent.trim())) {
-                        const r = b.getBoundingClientRect();
-                        return {x: r.left + r.width/2, y: r.top + r.height/2};
+        # 6. Confirm Order modal — poll up to 5 s.  SUBMIT → modal transition
+        # can lag, but if no modal appears at all, the SUBMIT click didn't
+        # trigger a real submission and we must NOT treat it as success.
+        conf_xy = None
+        for _ in range(10):
+            conf_xy = await page.evaluate(
+                """() => {
+                    const ok = ['Confirm Order', 'CONFIRM ORDER', 'Confirm'];
+                    for (const d of document.querySelectorAll('[role="dialog"], [role="alertdialog"]')) {
+                        if (!d.offsetParent) continue;
+                        if (!d.textContent.includes('Confirm Order') && !d.textContent.includes('Confirm')) continue;
+                        for (const b of d.querySelectorAll('button')) {
+                            if (ok.includes(b.textContent.trim())) {
+                                const r = b.getBoundingClientRect();
+                                return {x: r.left + r.width/2, y: r.top + r.height/2};
+                            }
+                        }
                     }
-                }
-                return null;
-            }"""
-        )
-        if conf_xy:
-            await page.mouse.click(conf_xy["x"], conf_xy["y"])
-            await asyncio.sleep(1.5)
+                    return null;
+                }"""
+            )
+            if conf_xy:
+                break
+            await asyncio.sleep(0.5)
+        if not conf_xy:
+            await press_escape(page)
+            return False
+        await page.mouse.click(conf_xy["x"], conf_xy["y"])
+        await asyncio.sleep(1.5)
+
+        # 7. Optional real-fill verification: poll CME Open Positions qty
+        # for the contract until it differs from the pre-submit snapshot.
+        # Without this, a silently-rejected order (margin limit, contract
+        # expired, etc.) still "succeeds" above because all the clicks
+        # landed.  Only active when the caller supplied verify_contract.
+        if verify_contract is not None:
+            assert qty_before is not None
+            qty_after = qty_before
+            for _ in range(20):  # up to 10 s
+                qty_after = await self.get_position_qty(verify_contract)
+                if qty_after != qty_before:
+                    break
+                await asyncio.sleep(0.5)
+            if qty_after == qty_before:
+                return False
         return True
 
-    async def buy_market(self, instrument_name: str, qty: int = 1) -> bool:
-        """Open a MARKET BUY ``qty``-contract order.  (Qty>1 not yet wired —
-        currently always submits with the dialog's default 1.)"""
-        if qty != 1:
-            raise NotImplementedError("qty>1 not implemented; open qty=1 in a loop")
-        return await self._execute_market_order(instrument_name, "BUY")
+    async def buy_market(
+        self,
+        instrument_name: str,
+        qty: int = 1,
+        verify_contract: str | None = None,
+    ) -> bool:
+        """
+        Open a MARKET BUY ``qty``-contract order.
 
-    async def sell_market(self, instrument_name: str, qty: int = 1) -> bool:
-        """Open a MARKET SELL ``qty``-contract order (opens a short)."""
+        Parameters
+        ----------
+        instrument_name : str
+            Row name in the Markets widget (e.g. ``"Micro Gold"``).
+        qty : int, default 1
+            Must be 1 for now.  The Trade dialog's quantity input is not
+            currently driven by this client; submit ``qty=1`` in a loop if
+            you need more.
+        verify_contract : str, optional
+            When provided (e.g. ``"MGCM6"``), the method snapshots the
+            signed CME Open Positions qty for that contract before the
+            SUBMIT click and polls up to 10 s after Confirm for it to
+            change.  If the qty never changes, the method returns False —
+            catching silently-rejected orders.  Without this argument the
+            method only checks that the UI clicks landed, which can still
+            produce false positives.
+        """
         if qty != 1:
             raise NotImplementedError("qty>1 not implemented; open qty=1 in a loop")
-        return await self._execute_market_order(instrument_name, "SELL")
+        return await self._execute_market_order(
+            instrument_name, "BUY", verify_contract=verify_contract
+        )
+
+    async def sell_market(
+        self,
+        instrument_name: str,
+        qty: int = 1,
+        verify_contract: str | None = None,
+    ) -> bool:
+        """
+        Open a MARKET SELL ``qty``-contract order (opens a short).
+
+        See :py:meth:`buy_market` for parameter docs including the
+        ``verify_contract`` real-fill guard.
+        """
+        if qty != 1:
+            raise NotImplementedError("qty>1 not implemented; open qty=1 in a loop")
+        return await self._execute_market_order(
+            instrument_name, "SELL", verify_contract=verify_contract
+        )
 
     # ------------------------------------------------------------------
     # Position management

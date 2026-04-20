@@ -3,4 +3,4 @@ Trading Simulator.  See README.md for setup and caveats."""
 from .client import CMESimulatorClient, DEFAULT_CDP_URL
 
 __all__ = ["CMESimulatorClient", "DEFAULT_CDP_URL"]
-__version__ = "0.1.0"
+__version__ = "0.2.0"
